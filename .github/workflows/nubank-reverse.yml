@@ -18,86 +18,40 @@ on:
 
 jobs:
   reverse:
-    name: Reverse Engineering on ARM64
-    runs-on: ubuntu-24.04-arm
+    name: Reverse Engineering on macOS ARM64 (Apple Silicon)
+    runs-on: macos-latest
     timeout-minutes: 90
     permissions:
       contents: read
       actions: write
 
     env:
-      ANDROID_HOME: /opt/android-sdk
+      ANDROID_HOME: /usr/local/share/android-sdk
 
     steps:
       # ──────────────────────────────────────────────
-      # SYSTEM DEPENDENCIES
+      # SYSTEM DEPENDENCIES (macOS)
       # ──────────────────────────────────────────────
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            openjdk-17-jdk-headless \
-            python3-pip \
-            python3-venv \
-            qemu-kvm \
-            libvirt-daemon-system \
-            bridge-utils \
-            wget \
-            unzip \
-            curl \
-            jq \
-            git \
-            adb \
-            fastboot \
-            lz4 \
-            zstd \
-            squashfs-tools
+          brew update
+          brew install python3 wget unzip curl jq git openjdk@17
+          echo 'export PATH="/usr/local/opt/openjdk@17/bin:$PATH"' >> ~/.zshrc
 
       # ──────────────────────────────────────────────
-      # ANDROID SDK + ARM64 SYSTEM IMAGE (MANUAL)
+      # ANDROID SDK via setup-android (works on macOS ARM64)
       # ──────────────────────────────────────────────
-      - name: Install Android SDK manually
-        run: |
-          # Download and install Android command line tools
-          wget -q "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -O cmdline-tools.zip
-          mkdir -p $ANDROID_HOME/cmdline-tools
-          unzip -q cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools
-          mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
-          rm cmdline-tools.zip
-          
-          # Accept licenses and install packages
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
-          
-          # Install packages one by one to handle failures gracefully
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-33" || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;33.0.2" || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "system-images;android-33;google_apis_playstore;arm64-v8a" || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" || true
-          
-          # Try emulator package (may not be available for ARM64 host)
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" || true
-          
-          # Verify installation
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "system-images|platform-tools|platforms|build-tools|emulator|ndk" || true
+      - name: Setup Android SDK with emulator
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 33
+          ndk-version: r26d
+          emulator: true
+          cmdline-tools-version: latest
+          accept-android-sdk-licenses: true
 
       # ──────────────────────────────────────────────
-      # DOWNLOAD EMULATOR FROM OFFICIAL REPOSITORY
-      # ──────────────────────────────────────────────
-      - name: Download and install emulator
-        run: |
-          # Use the official emulator repository metadata to find latest
-          EMULATOR_URL="https://dl.google.com/android/repository/emulator-linux_x64-9755546.zip"
-          echo "Downloading emulator from $EMULATOR_URL"
-          wget -q "$EMULATOR_URL" -O emulator.zip
-          unzip -q emulator.zip -d $ANDROID_HOME
-          rm emulator.zip
-          chmod +x $ANDROID_HOME/emulator/emulator
-          chmod +x $ANDROID_HOME/emulator/emulator-*
-          ls -la $ANDROID_HOME/emulator/
-
-      # ──────────────────────────────────────────────
-      # CREATE AND BOOT ARM64 AVD WITH KVM
+      # CREATE AND BOOT ARM64 AVD (native on Apple Silicon)
       # ──────────────────────────────────────────────
       - name: Create AVD
         run: |
@@ -107,21 +61,16 @@ jobs:
             --device "pixel_6" \
             --force
 
-      - name: Start emulator with KVM
+      - name: Start emulator
         run: |
-          # Enable KVM acceleration
-          sudo chmod 666 /dev/kvm || true
-          
-          # Start emulator in background
           nohup $ANDROID_HOME/emulator/emulator \
             -avd pixel6_arm64 \
             -no-snapshot-load \
             -no-boot-anim \
             -gpu swiftshader_indirect \
-            -accel on \
             -no-audio \
             -no-window \
-            -qemu -cpu host > emulator.log 2>&1 &
+            -accel on > emulator.log 2>&1 &
           
           echo "Emulator started, waiting for boot..."
 
@@ -184,7 +133,6 @@ jobs:
       - name: Repack with reFlutter (JIT + debug)
         run: |
           reflutter base.apk
-          # Output: base.reflutter.apk
           ls -la base.reflutter.apk
 
       # ──────────────────────────────────────────────
@@ -193,12 +141,10 @@ jobs:
       - name: Install repacked APK with splits
         run: |
           adb install-multiple base.reflutter.apk split_config.arm64_v8a.apk split_config.xxxhdpi.apk
-          
-          # Verify installation
           adb shell pm list packages | grep nubank
 
       # ──────────────────────────────────────────────
-      # START FRIDA SERVER (WITH ADB ROOT)
+      # START FRIDA SERVER
       # ──────────────────────────────────────────────
       - name: Download and start Frida server
         run: |
@@ -206,8 +152,6 @@ jobs:
           wget -q "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-arm64.xz" -O frida-server.xz
           xz -d frida-server.xz
           chmod +x frida-server
-          
-          # CRITICAL: adb root first (emulator supports this)
           adb root
           adb push frida-server /data/local/tmp/frida-server
           adb shell "/data/local/tmp/frida-server &"
@@ -229,24 +173,18 @@ jobs:
       - name: Create Frida dump script
         run: |
           cat > /tmp/dump_widget_tree.js << 'EOF'
-          // Frida script to dump Flutter widget tree for login screen
-          // Uses frida-flutter bindings with fallbacks
-          
           Java.perform(async () => {
             console.log("[*] Starting Flutter widget tree dump...");
             
             try {
               const Flutter = require('frida-flutter');
               
-              // Wait for Flutter engine
               await Flutter.waitForFlutter();
               console.log("[*] Flutter engine found");
               
-              // Get widget tree
               const tree = await Flutter.getWidgetTree();
               console.log("[*] Widget tree retrieved");
               
-              // Find login/password screen widgets
               const loginWidgets = Flutter.findWidgets(tree, (w) => {
                 const name = w.type || w.className || '';
                 return name.toLowerCase().includes('login') || 
@@ -258,13 +196,11 @@ jobs:
               
               console.log("[*] Login-related widgets:", JSON.stringify(loginWidgets, null, 2));
               
-              // Try to get additional details (may not exist in all frida-flutter versions)
               let colorScheme = null, textStyles = null, constraints = null;
               try { colorScheme = await Flutter.getColorScheme(); } catch (e) { console.log("[!] getColorScheme failed:", e.message); }
               try { textStyles = await Flutter.getTextStyles(); } catch (e) { console.log("[!] getTextStyles failed:", e.message); }
               try { constraints = await Flutter.getConstraints(); } catch (e) { console.log("[!] getConstraints failed:", e.message); }
               
-              // Dump full tree with resolved properties
               const fullDump = {
                 timestamp: Date.now(),
                 widgetTree: tree,
@@ -274,7 +210,6 @@ jobs:
                 constraints: constraints,
               };
               
-              // Write to file on device
               const fs = require('fs');
               const path = '/data/local/tmp/widget_tree_dump.json';
               fs.writeFileSync(path, JSON.stringify(fullDump, null, 2));
@@ -282,41 +217,28 @@ jobs:
               
             } catch (e) {
               console.log("[ERROR] Frida dump failed:", e.message, e.stack);
-              // Fallback: basic dump without frida-flutter
               const fs = require('fs');
-              const fallback = {
-                timestamp: Date.now(),
-                error: e.message,
-                stack: e.stack
-              };
+              const fallback = { timestamp: Date.now(), error: e.message, stack: e.stack };
               fs.writeFileSync('/data/local/tmp/widget_tree_dump.json', JSON.stringify(fallback, null, 2));
             }
           });
-          
-          // Keep script alive
           setTimeout(() => {}, 60000);
           EOF
 
       - name: Run Frida dump on Nubank app
         run: |
-          # Stop app first, then spawn fresh with frida
           adb shell am force-stop br.com.nubank
           sleep 2
           
-          # Dump widget tree (spawn mode -f)
           frida -U -f br.com.nubank -l /tmp/dump_widget_tree.js --no-pause -o frida_output.log &
           FRIDA_PID=$!
           
-          # Wait for dump
           sleep 40
           
-          # Kill frida
           kill $FRIDA_PID 2>/dev/null || true
           
-          # Pull dump
           adb pull /data/local/tmp/widget_tree_dump.json ./widget-tree-exact.json
           
-          # Check if dump exists
           if [ -f ./widget-tree-exact.json ]; then
             echo "Widget tree dump successful"
             head -c 5000 ./widget-tree-exact.json
@@ -332,27 +254,23 @@ jobs:
         run: |
           mkdir -p screenshots
           
-          # Start app fresh
           adb shell am force-stop br.com.nubank
           sleep 1
           adb shell am start -n br.com.nubank/.MainActivity
           sleep 5
           
-          # Screenshot 1: Clean state
           adb shell screencap -p /sdcard/clean.png
           adb pull /sdcard/clean.png ./screenshots/clean.png
           
-          # Try to interact - tap password field area, enter wrong password
-          adb shell input tap 540 1200  # Tap password field (approx center)
+          adb shell input tap 540 1200
           sleep 1
-          adb shell input text "000000"  # Enter wrong password
+          adb shell input text "000000"
           sleep 1
-          adb shell input keyevent 66  # Enter
+          adb shell input keyevent 66
           sleep 3
           adb shell screencap -p /sdcard/error.png
           adb pull /sdcard/error.png ./screenshots/error.png
           
-          # Screenshot 3: Filled state (before submit)
           adb shell am force-stop br.com.nubank
           sleep 1
           adb shell am start -n br.com.nubank/.MainActivity
@@ -394,11 +312,9 @@ jobs:
               fs.writeFileSync('/data/local/tmp/flutter_details.json', JSON.stringify({error: e.message}, null, 2));
             }
           });
-          
           setTimeout(() => {}, 30000);
           EOF
           
-          # Spawn fresh for details
           adb shell am force-stop br.com.nubank
           sleep 1
           
@@ -408,7 +324,6 @@ jobs:
           
           adb pull /data/local/tmp/flutter_details.json ./color-scheme.json 2>/dev/null || echo "Details not extracted"
           
-          # Also dump manifest for font/assets info
           adb shell "pm dump br.com.nubank" > ./package_dump.txt 2>/dev/null || true
 
       # ──────────────────────────────────────────────
