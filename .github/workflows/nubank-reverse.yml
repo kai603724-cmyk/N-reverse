@@ -20,7 +20,7 @@ jobs:
   reverse:
     name: Reverse Engineering on macOS ARM64 (Apple Silicon)
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
       actions: write
@@ -37,6 +37,8 @@ jobs:
           brew update
           brew install python3 wget unzip curl jq git openjdk@17
           echo 'export PATH="/usr/local/opt/openjdk@17/bin:$PATH"' >> ~/.zshrc
+          java -version
+          python3 --version
 
       # ──────────────────────────────────────────────
       # ANDROID SDK via setup-android (works on macOS ARM64)
@@ -50,6 +52,14 @@ jobs:
           cmdline-tools-version: latest
           accept-android-sdk-licenses: true
 
+      - name: Verify Android SDK installation
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -la $ANDROID_HOME/
+          ls -la $ANDROID_HOME/emulator/
+          ls -la $ANDROID_HOME/platform-tools/
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "emulator|system-images|platform-tools"
+
       # ──────────────────────────────────────────────
       # CREATE AND BOOT ARM64 AVD (native on Apple Silicon)
       # ──────────────────────────────────────────────
@@ -60,9 +70,11 @@ jobs:
             -k "system-images;android-33;google_apis_playstore;arm64-v8a" \
             --device "pixel_6" \
             --force
+          echo "AVD created"
 
-      - name: Start emulator
+      - name: Start emulator with logging
         run: |
+          # Start emulator with verbose logging
           nohup $ANDROID_HOME/emulator/emulator \
             -avd pixel6_arm64 \
             -no-snapshot-load \
@@ -70,36 +82,50 @@ jobs:
             -gpu swiftshader_indirect \
             -no-audio \
             -no-window \
-            -accel on > emulator.log 2>&1 &
+            -accel on \
+            -verbose > emulator.log 2>&1 &
           
-          echo "Emulator started, waiting for boot..."
-
-      - name: Wait for emulator boot and verify ARM64
-        run: |
-          # Wait for adb
-          for i in {1..60}; do
+          EMULATOR_PID=$!
+          echo "Emulator PID: $EMULATOR_PID"
+          echo "Waiting for emulator to start..."
+          
+          # Wait for adb to appear
+          for i in {1..120}; do
             if adb devices | grep -q "emulator"; then
-              echo "ADB connected"
+              echo "ADB connected at attempt $i"
               break
             fi
             sleep 5
+            if [ $i -eq 120 ]; then
+              echo "TIMEOUT: Emulator didn't start"
+              cat emulator.log
+              exit 1
+            fi
           done
-          
-          # Wait for boot completed
-          for i in {1..180}; do
+
+      - name: Wait for boot completed
+        run: |
+          echo "Waiting for boot completed..."
+          for i in {1..240}; do
             BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
             if [ "$BOOT" = "1" ]; then
-              echo "Boot completed"
+              echo "Boot completed at attempt $i"
               break
             fi
             sleep 5
+            if [ $i -eq 240 ]; then
+              echo "TIMEOUT: Boot not completed"
+              adb shell getprop sys.boot_completed
+              cat emulator.log
+              exit 1
+            fi
           done
           
-          # VERIFY ARM64
+          # Verify ARM64
           ABI=$(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')
           echo "Device ABI: $ABI"
           if [ "$ABI" != "arm64-v8a" ]; then
-            echo "ERROR: Emulator is not ARM64! ABI=$ABI"
+            echo "ERROR: Not ARM64! ABI=$ABI"
             exit 1
           fi
           
@@ -107,6 +133,10 @@ jobs:
           adb shell settings put global hidden_api_policy_pre_p_apps 1
           adb shell settings put global hidden_api_policy_p_apps 1
           adb shell settings put global hidden_api_policy 1
+          
+          echo "Device ready!"
+          adb shell getprop ro.product.model
+          adb shell getprop ro.build.version.release
 
       # ──────────────────────────────────────────────
       # DOWNLOAD NUBANK APK
@@ -122,6 +152,7 @@ jobs:
           wget -q "$SPLIT_XXXHDPI_URL" -O split_config.xxxhdpi.apk
           
           ls -la *.apk
+          file base.apk
 
       # ──────────────────────────────────────────────
       # REFLUTTER REPACK
@@ -183,7 +214,7 @@ jobs:
               console.log("[*] Flutter engine found");
               
               const tree = await Flutter.getWidgetTree();
-              console.log("[*] Widget tree retrieved");
+              console.log("[*] Widget tree retrieved, nodes:", tree?.length || 0);
               
               const loginWidgets = Flutter.findWidgets(tree, (w) => {
                 const name = w.type || w.className || '';
@@ -230,13 +261,15 @@ jobs:
           adb shell am force-stop br.com.nubank
           sleep 2
           
+          echo "Starting Frida dump..."
           frida -U -f br.com.nubank -l /tmp/dump_widget_tree.js --no-pause -o frida_output.log &
           FRIDA_PID=$!
           
-          sleep 40
+          sleep 50
           
           kill $FRIDA_PID 2>/dev/null || true
           
+          echo "Pulling dump..."
           adb pull /data/local/tmp/widget_tree_dump.json ./widget-tree-exact.json
           
           if [ -f ./widget-tree-exact.json ]; then
@@ -245,6 +278,7 @@ jobs:
           else
             echo "Dump not found, checking frida output"
             cat frida_output.log
+            exit 1
           fi
 
       # ──────────────────────────────────────────────
@@ -257,24 +291,27 @@ jobs:
           adb shell am force-stop br.com.nubank
           sleep 1
           adb shell am start -n br.com.nubank/.MainActivity
-          sleep 5
+          sleep 8
           
+          # Screenshot 1: Clean state
           adb shell screencap -p /sdcard/clean.png
           adb pull /sdcard/clean.png ./screenshots/clean.png
           
+          # Interact for error state
           adb shell input tap 540 1200
           sleep 1
           adb shell input text "000000"
           sleep 1
           adb shell input keyevent 66
-          sleep 3
+          sleep 4
           adb shell screencap -p /sdcard/error.png
           adb pull /sdcard/error.png ./screenshots/error.png
           
+          # Screenshot 3: Filled state
           adb shell am force-stop br.com.nubank
           sleep 1
           adb shell am start -n br.com.nubank/.MainActivity
-          sleep 5
+          sleep 8
           adb shell input tap 540 1200
           sleep 1
           adb shell input text "123456"
@@ -319,7 +356,7 @@ jobs:
           sleep 1
           
           frida -U -f br.com.nubank -l /tmp/extract_details.js --no-pause -o details.log &
-          sleep 25
+          sleep 30
           kill %1 2>/dev/null || true
           
           adb pull /data/local/tmp/flutter_details.json ./color-scheme.json 2>/dev/null || echo "Details not extracted"
