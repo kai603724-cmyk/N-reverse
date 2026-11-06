@@ -35,22 +35,25 @@ jobs:
       - name: Install system dependencies
         run: |
           brew update
-          brew install python3 wget unzip curl jq git openjdk@17
-          echo 'export PATH="/usr/local/opt/openjdk@17/bin:$PATH"' >> ~/.zshrc
+          brew install python3 wget unzip curl jq git
           java -version
           python3 --version
 
       # ──────────────────────────────────────────────
-      # ANDROID SDK via setup-android (works on macOS ARM64)
+      # ANDROID SDK via setup-android (correct inputs for v3)
       # ──────────────────────────────────────────────
       - name: Setup Android SDK with emulator
         uses: android-actions/setup-android@v3
         with:
-          api-level: 33
-          ndk-version: r26d
-          emulator: true
           cmdline-tools-version: latest
           accept-android-sdk-licenses: true
+          packages: |
+            platform-tools
+            platforms;android-33
+            build-tools;33.0.2
+            system-images;android-33;google_apis_playstore;arm64-v8a
+            emulator
+            ndk;26.1.10909125
 
       - name: Verify Android SDK installation
         run: |
