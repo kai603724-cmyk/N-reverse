@@ -57,19 +57,18 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          api-level: 33
-          ndk-version: r26d
-          emulator: false
-          cmdline-tools: latest
+          cmdline-tools-version: latest
+          accept-android-sdk-licenses: true
 
-      - name: Install ARM64 system image
+      - name: Install ARM64 system image and tools
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
             "system-images;android-33;google_apis_playstore;arm64-v8a" \
             "platform-tools" \
             "platforms;android-33" \
             "build-tools;33.0.2" \
-            "emulator"
+            "emulator" \
+            "ndk;26.1.10909125"
 
       # ──────────────────────────────────────────────
       # CREATE AND BOOT ARM64 AVD WITH KVM
@@ -125,37 +124,7 @@ jobs:
           adb shell settings put global hidden_api_policy_p_apps 1
           adb shell settings put global hidden_api_policy 1
 
-      # ──────────────────────────────────────────────
-      # INSTALL MAGISK FOR ROOT
-      # ──────────────────────────────────────────────
-      - name: Download and install Magisk
-        run: |
-          # Download Magisk for API 33 (Android 13)
-          MAGISK_VERSION="26.4"
-          wget -q "https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VERSION}/Magisk-v${MAGISK_VERSION}.apk" -O Magisk.apk
-          
-          # Install Magisk app
-          adb install Magisk.apk
-          
-          # Download Magisk boot image patcher (we'll use the app to patch)
-          # For emulator, we can use the pre-rooted approach
-          # Actually, for emulator we can just use the magisk boot image
-          
-      - name: Root emulator with Magisk (emulator-specific)
-        run: |
-          # For emulator, we can remount and push magisk binaries
-          adb root
-          adb remount
-          
-          # Push magisk binaries
-          adb push Magisk.apk /data/local/tmp/Magisk.apk
-          
-          # Install magisk via the app (requires UI interaction, complex)
-          # Alternative: use pre-rooted system image or magisk patched boot.img
-          # For GitHub Actions, simpler: use the emulator's built-in root (adb root)
-          # and install frida-server directly as root
-          
-          echo "Using adb root for Frida (emulator is already rootable)"
+      
 
       # ──────────────────────────────────────────────
       # DOWNLOAD NUBANK APK
@@ -279,9 +248,8 @@ jobs:
           adb shell am start -n br.com.nubank/.MainActivity
           sleep 5
           
-          # Navigate to password screen (this would need UI automation)
-          # For now, dump whatever screen is active
-          frida -U -f br.com.nubank -l /tmp/dump_widget_tree.js --no-pause -o /tmp/frida_output.log &
+          # Dump widget tree
+          frida -U -f br.com.nubank -l /tmp/dump_widget_tree.js --no-pause -o frida_output.log &
           FRIDA_PID=$!
           
           # Wait for dump
@@ -299,7 +267,7 @@ jobs:
             head -c 5000 ./widget-tree-exact.json
           else
             echo "Dump not found, checking frida output"
-            cat /tmp/frida_output.log
+            cat frida_output.log
           fi
 
       # ──────────────────────────────────────────────
@@ -368,7 +336,7 @@ jobs:
           setTimeout(() => {}, 30000);
           EOF
           
-          frida -U -f br.com.nubank -l /tmp/extract_details.js --no-pause -o /tmp/details.log &
+          frida -U -f br.com.nubank -l /tmp/extract_details.js --no-pause -o details.log &
           sleep 20
           kill %1 2>/dev/null || true
           
@@ -415,7 +383,7 @@ jobs:
         with:
           name: frida-logs
           path: |
-            /tmp/frida_output.log
-            /tmp/details.log
+            frida_output.log
+            details.log
             emulator.log
           retention-days: 7
