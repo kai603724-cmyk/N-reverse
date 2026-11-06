@@ -18,7 +18,7 @@ on:
 
 jobs:
   reverse:
-    name: Reverse Engineering on macOS ARM64 (Apple Silicon)
+    name: Reverse Engineering on macOS ARM64
     runs-on: macos-latest
     timeout-minutes: 120
     permissions:
@@ -40,31 +40,33 @@ jobs:
           python3 --version
 
       # ──────────────────────────────────────────────
-      # ANDROID SDK via setup-android (correct inputs for v3)
+      # ANDROID SDK MANUAL INSTALL (no buggy action)
       # ──────────────────────────────────────────────
-      - name: Setup Android SDK with emulator
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: latest
-          accept-android-sdk-licenses: true
-          packages: |
-            platform-tools
-            platforms;android-33
-            build-tools;33.0.2
-            system-images;android-33;google_apis_playstore;arm64-v8a
-            emulator
-            ndk;26.1.10909125
-
-      - name: Verify Android SDK installation
+      - name: Install Android SDK manually
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls -la $ANDROID_HOME/
-          ls -la $ANDROID_HOME/emulator/
-          ls -la $ANDROID_HOME/platform-tools/
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "emulator|system-images|platform-tools"
+          # Download command line tools
+          wget -q "https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip" -O cmdline-tools.zip
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          unzip -q cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools
+          mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+          rm cmdline-tools.zip
+          
+          # Accept licenses
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+          
+          # Install packages ONE BY ONE (avoid multi-line string bug)
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-33"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;33.0.2"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "system-images;android-33;google_apis_playstore;arm64-v8a"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125"
+          
+          # Verify
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "emulator|system-images|platform-tools|platforms|build-tools|ndk"
 
       # ──────────────────────────────────────────────
-      # CREATE AND BOOT ARM64 AVD (native on Apple Silicon)
+      # CREATE AND BOOT ARM64 AVD
       # ──────────────────────────────────────────────
       - name: Create AVD
         run: |
@@ -77,7 +79,6 @@ jobs:
 
       - name: Start emulator with logging
         run: |
-          # Start emulator with verbose logging
           nohup $ANDROID_HOME/emulator/emulator \
             -avd pixel6_arm64 \
             -no-snapshot-load \
@@ -90,9 +91,7 @@ jobs:
           
           EMULATOR_PID=$!
           echo "Emulator PID: $EMULATOR_PID"
-          echo "Waiting for emulator to start..."
           
-          # Wait for adb to appear
           for i in {1..120}; do
             if adb devices | grep -q "emulator"; then
               echo "ADB connected at attempt $i"
@@ -108,7 +107,6 @@ jobs:
 
       - name: Wait for boot completed
         run: |
-          echo "Waiting for boot completed..."
           for i in {1..240}; do
             BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
             if [ "$BOOT" = "1" ]; then
@@ -124,7 +122,6 @@ jobs:
             fi
           done
           
-          # Verify ARM64
           ABI=$(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')
           echo "Device ABI: $ABI"
           if [ "$ABI" != "arm64-v8a" ]; then
@@ -132,14 +129,11 @@ jobs:
             exit 1
           fi
           
-          # Hidden API policy
           adb shell settings put global hidden_api_policy_pre_p_apps 1
           adb shell settings put global hidden_api_policy_p_apps 1
           adb shell settings put global hidden_api_policy 1
           
           echo "Device ready!"
-          adb shell getprop ro.product.model
-          adb shell getprop ro.build.version.release
 
       # ──────────────────────────────────────────────
       # DOWNLOAD NUBANK APK
@@ -153,18 +147,15 @@ jobs:
           wget -q "$BASE_URL" -O base.apk
           wget -q "$SPLIT_ARM64_URL" -O split_config.arm64_v8a.apk
           wget -q "$SPLIT_XXXHDPI_URL" -O split_config.xxxhdpi.apk
-          
           ls -la *.apk
-          file base.apk
 
       # ──────────────────────────────────────────────
       # REFLUTTER REPACK
       # ──────────────────────────────────────────────
       - name: Install reFlutter
-        run: |
-          pip3 install reflutter
+        run: pip3 install reflutter
 
-      - name: Repack with reFlutter (JIT + debug)
+      - name: Repack with reFlutter
         run: |
           reflutter base.apk
           ls -la base.reflutter.apk
@@ -202,23 +193,19 @@ jobs:
           cd /tmp/frida-flutter && pip3 install -e .
 
       # ──────────────────────────────────────────────
-      # DUMP WIDGET TREE - LOGIN SCREEN (ROBUST)
+      # DUMP WIDGET TREE
       # ──────────────────────────────────────────────
       - name: Create Frida dump script
         run: |
           cat > /tmp/dump_widget_tree.js << 'EOF'
           Java.perform(async () => {
             console.log("[*] Starting Flutter widget tree dump...");
-            
             try {
               const Flutter = require('frida-flutter');
-              
               await Flutter.waitForFlutter();
               console.log("[*] Flutter engine found");
-              
               const tree = await Flutter.getWidgetTree();
               console.log("[*] Widget tree retrieved, nodes:", tree?.length || 0);
-              
               const loginWidgets = Flutter.findWidgets(tree, (w) => {
                 const name = w.type || w.className || '';
                 return name.toLowerCase().includes('login') || 
@@ -227,14 +214,11 @@ jobs:
                        name.toLowerCase().includes('pin') ||
                        name.toLowerCase().includes('passcode');
               });
-              
               console.log("[*] Login-related widgets:", JSON.stringify(loginWidgets, null, 2));
-              
               let colorScheme = null, textStyles = null, constraints = null;
               try { colorScheme = await Flutter.getColorScheme(); } catch (e) { console.log("[!] getColorScheme failed:", e.message); }
               try { textStyles = await Flutter.getTextStyles(); } catch (e) { console.log("[!] getTextStyles failed:", e.message); }
               try { constraints = await Flutter.getConstraints(); } catch (e) { console.log("[!] getConstraints failed:", e.message); }
-              
               const fullDump = {
                 timestamp: Date.now(),
                 widgetTree: tree,
@@ -243,12 +227,10 @@ jobs:
                 textStyles: textStyles,
                 constraints: constraints,
               };
-              
               const fs = require('fs');
               const path = '/data/local/tmp/widget_tree_dump.json';
               fs.writeFileSync(path, JSON.stringify(fullDump, null, 2));
               console.log("[*] Dump written to", path);
-              
             } catch (e) {
               console.log("[ERROR] Frida dump failed:", e.message, e.stack);
               const fs = require('fs');
@@ -263,44 +245,32 @@ jobs:
         run: |
           adb shell am force-stop br.com.nubank
           sleep 2
-          
-          echo "Starting Frida dump..."
           frida -U -f br.com.nubank -l /tmp/dump_widget_tree.js --no-pause -o frida_output.log &
           FRIDA_PID=$!
-          
           sleep 50
-          
           kill $FRIDA_PID 2>/dev/null || true
-          
-          echo "Pulling dump..."
           adb pull /data/local/tmp/widget_tree_dump.json ./widget-tree-exact.json
-          
           if [ -f ./widget-tree-exact.json ]; then
             echo "Widget tree dump successful"
             head -c 5000 ./widget-tree-exact.json
           else
-            echo "Dump not found, checking frida output"
+            echo "Dump not found"
             cat frida_output.log
             exit 1
           fi
 
       # ──────────────────────────────────────────────
-      # TAKE SCREENSHOTS OF LOGIN STATES
+      # TAKE SCREENSHOTS
       # ──────────────────────────────────────────────
       - name: Take screenshots (clean, filled, error)
         run: |
           mkdir -p screenshots
-          
           adb shell am force-stop br.com.nubank
           sleep 1
           adb shell am start -n br.com.nubank/.MainActivity
           sleep 8
-          
-          # Screenshot 1: Clean state
           adb shell screencap -p /sdcard/clean.png
           adb pull /sdcard/clean.png ./screenshots/clean.png
-          
-          # Interact for error state
           adb shell input tap 540 1200
           sleep 1
           adb shell input text "000000"
@@ -309,8 +279,6 @@ jobs:
           sleep 4
           adb shell screencap -p /sdcard/error.png
           adb pull /sdcard/error.png ./screenshots/error.png
-          
-          # Screenshot 3: Filled state
           adb shell am force-stop br.com.nubank
           sleep 1
           adb shell am start -n br.com.nubank/.MainActivity
@@ -321,28 +289,24 @@ jobs:
           sleep 1
           adb shell screencap -p /sdcard/filled.png
           adb pull /sdcard/filled.png ./screenshots/filled.png
-          
           ls -la screenshots/
 
       # ──────────────────────────────────────────────
-      # EXTRACT COLOR SCHEME, FONTS, CONSTRAINTS
+      # EXTRACT DETAILS
       # ──────────────────────────────────────────────
       - name: Extract detailed Flutter properties
         run: |
           cat > /tmp/extract_details.js << 'EOF'
           const Flutter = require('frida-flutter');
-          
           Java.perform(async () => {
             try {
               await Flutter.waitForFlutter();
-              
               const details = {};
               try { details.colorScheme = await Flutter.getColorScheme(); } catch (e) { details.colorSchemeError = e.message; }
               try { details.textStyles = await Flutter.getTextStyles(); } catch (e) { details.textStylesError = e.message; }
               try { details.constraints = await Flutter.getConstraints(); } catch (e) { details.constraintsError = e.message; }
               try { details.animations = await Flutter.getAnimations(); } catch (e) { details.animationsError = e.message; }
               try { details.theme = await Flutter.getThemeData(); } catch (e) { details.themeError = e.message; }
-              
               const fs = require('fs');
               fs.writeFileSync('/data/local/tmp/flutter_details.json', JSON.stringify(details, null, 2));
               console.log("[*] Details extracted");
@@ -354,16 +318,12 @@ jobs:
           });
           setTimeout(() => {}, 30000);
           EOF
-          
           adb shell am force-stop br.com.nubank
           sleep 1
-          
           frida -U -f br.com.nubank -l /tmp/extract_details.js --no-pause -o details.log &
           sleep 30
           kill %1 2>/dev/null || true
-          
           adb pull /data/local/tmp/flutter_details.json ./color-scheme.json 2>/dev/null || echo "Details not extracted"
-          
           adb shell "pm dump br.com.nubank" > ./package_dump.txt 2>/dev/null || true
 
       # ──────────────────────────────────────────────
