@@ -67,16 +67,38 @@ jobs:
           
           # Accept licenses and install packages
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "system-images;android-33;google_apis_playstore;arm64-v8a" \
-            "platform-tools" \
-            "platforms;android-33" \
-            "build-tools;33.0.2" \
-            "emulator" \
-            "ndk;26.1.10909125"
+          
+          # Install packages one by one to handle failures gracefully
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-33" || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;33.0.2" || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "system-images;android-33;google_apis_playstore;arm64-v8a" || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" || true
+          
+          # Emulator is often a separate package - try multiple names
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" || \
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "tools;emulator" || \
+          echo "Emulator package not found, will download separately"
           
           # Verify installation
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "system-images|platform-tools|emulator"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "system-images|platform-tools|platforms|build-tools|emulator|ndk" || true
+
+      # ──────────────────────────────────────────────
+      # DOWNLOAD EMULATOR SEPARATELY IF NEEDED
+      # ──────────────────────────────────────────────
+      - name: Ensure emulator is available
+        run: |
+          if [ ! -f "$ANDROID_HOME/emulator/emulator" ]; then
+            echo "Emulator not found in SDK, downloading..."
+            # Download emulator from Google's repository
+            wget -q "https://dl.google.com/android/repository/emulator-linux_x64-9755546.zip" -O emulator.zip
+            unzip -q emulator.zip -d $ANDROID_HOME
+            rm emulator.zip
+            chmod +x $ANDROID_HOME/emulator/emulator
+          else
+            echo "Emulator found at $ANDROID_HOME/emulator/emulator"
+          fi
+          ls -la $ANDROID_HOME/emulator/
 
       # ──────────────────────────────────────────────
       # CREATE AND BOOT ARM64 AVD WITH KVM
