@@ -1,0 +1,421 @@
+name: Nubank Flutter Reverse Engineering
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct URL to Nubank base.apk (ARM64 variant)'
+        required: true
+        type: string
+      split_arm64_url:
+        description: 'Direct URL to split_config.arm64_v8a.apk'
+        required: true
+        type: string
+      split_xxxhdpi_url:
+        description: 'Direct URL to split_config.xxxhdpi.apk'
+        required: true
+        type: string
+
+jobs:
+  reverse:
+    name: Reverse Engineering on ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      # ──────────────────────────────────────────────
+      # SYSTEM DEPENDENCIES
+      # ──────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openjdk-17-jdk-headless \
+            python3-pip \
+            python3-venv \
+            qemu-kvm \
+            libvirt-daemon-system \
+            bridge-utils \
+            virt-manager \
+            wget \
+            unzip \
+            curl \
+            jq \
+            git \
+            adb \
+            fastboot \
+            lz4 \
+            zstd \
+            squashfs-tools
+
+      # ──────────────────────────────────────────────
+      # ANDROID SDK + ARM64 SYSTEM IMAGE
+      # ──────────────────────────────────────────────
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 33
+          ndk-version: r26d
+          emulator: false
+          cmdline-tools: latest
+
+      - name: Install ARM64 system image
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "system-images;android-33;google_apis_playstore;arm64-v8a" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2" \
+            "emulator"
+
+      # ──────────────────────────────────────────────
+      # CREATE AND BOOT ARM64 AVD WITH KVM
+      # ──────────────────────────────────────────────
+      - name: Create AVD
+        run: |
+          echo "no" | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd \
+            -n pixel6_arm64 \
+            -k "system-images;android-33;google_apis_playstore;arm64-v8a" \
+            --device "pixel_6" \
+            --force
+
+      - name: Start emulator with KVM
+        run: |
+          # Enable KVM acceleration
+          sudo chmod 666 /dev/kvm || true
+          
+          # Start emulator in background
+          nohup $ANDROID_HOME/emulator/emulator \
+            -avd pixel6_arm64 \
+            -no-snapshot-load \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -accel on \
+            -no-audio \
+            -no-window \
+            -qemu -cpu host > emulator.log 2>&1 &
+          
+          echo "Emulator started, waiting for boot..."
+
+      - name: Wait for emulator boot
+        run: |
+          # Wait for adb
+          for i in {1..60}; do
+            if adb devices | grep -q "emulator"; then
+              echo "ADB connected"
+              break
+            fi
+            sleep 5
+          done
+          
+          # Wait for boot completed
+          for i in {1..120}; do
+            BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$BOOT" = "1" ]; then
+              echo "Boot completed"
+              break
+            fi
+            sleep 5
+          done
+          
+          adb shell settings put global hidden_api_policy_pre_p_apps 1
+          adb shell settings put global hidden_api_policy_p_apps 1
+          adb shell settings put global hidden_api_policy 1
+
+      # ──────────────────────────────────────────────
+      # INSTALL MAGISK FOR ROOT
+      # ──────────────────────────────────────────────
+      - name: Download and install Magisk
+        run: |
+          # Download Magisk for API 33 (Android 13)
+          MAGISK_VERSION="26.4"
+          wget -q "https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VERSION}/Magisk-v${MAGISK_VERSION}.apk" -O Magisk.apk
+          
+          # Install Magisk app
+          adb install Magisk.apk
+          
+          # Download Magisk boot image patcher (we'll use the app to patch)
+          # For emulator, we can use the pre-rooted approach
+          # Actually, for emulator we can just use the magisk boot image
+          
+      - name: Root emulator with Magisk (emulator-specific)
+        run: |
+          # For emulator, we can remount and push magisk binaries
+          adb root
+          adb remount
+          
+          # Push magisk binaries
+          adb push Magisk.apk /data/local/tmp/Magisk.apk
+          
+          # Install magisk via the app (requires UI interaction, complex)
+          # Alternative: use pre-rooted system image or magisk patched boot.img
+          # For GitHub Actions, simpler: use the emulator's built-in root (adb root)
+          # and install frida-server directly as root
+          
+          echo "Using adb root for Frida (emulator is already rootable)"
+
+      # ──────────────────────────────────────────────
+      # DOWNLOAD NUBANK APK
+      # ──────────────────────────────────────────────
+      - name: Download Nubank APK splits
+        env:
+          BASE_URL: ${{ github.event.inputs.apk_url }}
+          SPLIT_ARM64_URL: ${{ github.event.inputs.split_arm64_url }}
+          SPLIT_XXXHDPI_URL: ${{ github.event.inputs.split_xxxhdpi_url }}
+        run: |
+          wget -q "$BASE_URL" -O base.apk
+          wget -q "$SPLIT_ARM64_URL" -O split_config.arm64_v8a.apk
+          wget -q "$SPLIT_XXXHDPI_URL" -O split_config.xxxhdpi.apk
+          
+          ls -la *.apk
+
+      # ──────────────────────────────────────────────
+      # REFLUTTER REPACK
+      # ──────────────────────────────────────────────
+      - name: Install reFlutter
+        run: |
+          pip3 install reflutter
+
+      - name: Repack with reFlutter (JIT + debug)
+        run: |
+          reflutter base.apk
+          # Output: base.reflutter.apk
+          ls -la base.reflutter.apk
+
+      # ──────────────────────────────────────────────
+      # INSTALL REPACKED APK
+      # ──────────────────────────────────────────────
+      - name: Install repacked APK with splits
+        run: |
+          adb install-multiple base.reflutter.apk split_config.arm64_v8a.apk split_config.xxxhdpi.apk
+          
+          # Verify installation
+          adb shell pm list packages | grep nubank
+
+      # ──────────────────────────────────────────────
+      # START FRIDA SERVER
+      # ──────────────────────────────────────────────
+      - name: Download and start Frida server
+        run: |
+          FRIDA_VERSION="16.5.6"
+          wget -q "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-arm64.xz" -O frida-server.xz
+          xz -d frida-server.xz
+          chmod +x frida-server
+          adb push frida-server /data/local/tmp/frida-server
+          adb shell "/data/local/tmp/frida-server &"
+          sleep 3
+          adb shell "ps | grep frida-server"
+
+      # ──────────────────────────────────────────────
+      # INSTALL FRIDA-TOOLS AND FLUTTER HOOKS
+      # ──────────────────────────────────────────────
+      - name: Install Frida tools and frida-flutter
+        run: |
+          pip3 install frida-tools
+          git clone https://github.com/dorneanu/frida-flutter /tmp/frida-flutter
+          cd /tmp/frida-flutter && pip3 install -e .
+
+      # ──────────────────────────────────────────────
+      # DUMP WIDGET TREE - LOGIN SCREEN
+      # ──────────────────────────────────────────────
+      - name: Create Frida dump script
+        run: |
+          cat > /tmp/dump_widget_tree.js << 'EOF'
+          // Frida script to dump Flutter widget tree for login screen
+          // Uses frida-flutter bindings
+          
+          const Flutter = require('frida-flutter');
+          
+          Java.perform(async () => {
+            console.log("[*] Starting Flutter widget tree dump...");
+            
+            // Wait for Flutter engine
+            await Flutter.waitForFlutter();
+            console.log("[*] Flutter engine found");
+            
+            // Get widget tree
+            const tree = await Flutter.getWidgetTree();
+            console.log("[*] Widget tree retrieved");
+            
+            // Find login/password screen widgets
+            const loginWidgets = Flutter.findWidgets(tree, (w) => {
+              const name = w.type || w.className || '';
+              return name.toLowerCase().includes('login') || 
+                     name.toLowerCase().includes('password') ||
+                     name.toLowerCase().includes('senha') ||
+                     name.toLowerCase().includes('pin') ||
+                     name.toLowerCase().includes('passcode');
+            });
+            
+            console.log("[*] Login-related widgets:", JSON.stringify(loginWidgets, null, 2));
+            
+            // Dump full tree with resolved properties
+            const fullDump = {
+              timestamp: Date.now(),
+              widgetTree: tree,
+              loginWidgets: loginWidgets,
+              colorScheme: await Flutter.getColorScheme(),
+              textStyles: await Flutter.getTextStyles(),
+              constraints: await Flutter.getConstraints(),
+            };
+            
+            // Write to file on device
+            const fs = require('fs');
+            const path = '/data/local/tmp/widget_tree_dump.json';
+            fs.writeFileSync(path, JSON.stringify(fullDump, null, 2));
+            console.log("[*] Dump written to", path);
+          });
+          
+          // Keep script alive
+          setTimeout(() => {}, 60000);
+          EOF
+
+      - name: Run Frida dump on Nubank app
+        run: |
+          # Start Nubank app
+          adb shell am start -n br.com.nubank/.MainActivity
+          sleep 5
+          
+          # Navigate to password screen (this would need UI automation)
+          # For now, dump whatever screen is active
+          frida -U -f br.com.nubank -l /tmp/dump_widget_tree.js --no-pause -o /tmp/frida_output.log &
+          FRIDA_PID=$!
+          
+          # Wait for dump
+          sleep 30
+          
+          # Kill frida
+          kill $FRIDA_PID 2>/dev/null || true
+          
+          # Pull dump
+          adb pull /data/local/tmp/widget_tree_dump.json ./widget-tree-exact.json
+          
+          # Check if dump exists
+          if [ -f ./widget-tree-exact.json ]; then
+            echo "Widget tree dump successful"
+            head -c 5000 ./widget-tree-exact.json
+          else
+            echo "Dump not found, checking frida output"
+            cat /tmp/frida_output.log
+          fi
+
+      # ──────────────────────────────────────────────
+      # TAKE SCREENSHOTS OF LOGIN STATES
+      # ──────────────────────────────────────────────
+      - name: Take screenshots (clean, filled, error)
+        run: |
+          mkdir -p screenshots
+          
+          # Screenshot 1: Clean state
+          adb shell screencap -p /sdcard/clean.png
+          adb pull /sdcard/clean.png ./screenshots/clean.png
+          
+          # Try to interact - tap password field, enter wrong password
+          # This requires UIAutomator or Frida interaction
+          # For now, capture what we have
+          
+          # Screenshot 2: After some interaction attempt
+          adb shell input tap 540 1200  # Tap password field (approx)
+          sleep 1
+          adb shell input text "000000"  # Enter wrong password
+          sleep 1
+          adb shell input keyevent 66  # Enter
+          sleep 2
+          adb shell screencap -p /sdcard/error.png
+          adb pull /sdcard/error.png ./screenshots/error.png
+          
+          # Screenshot 3: Filled state (before submit)
+          adb shell am force-stop br.com.nubank
+          sleep 1
+          adb shell am start -n br.com.nubank/.MainActivity
+          sleep 3
+          adb shell input tap 540 1200
+          sleep 1
+          adb shell input text "123456"
+          sleep 1
+          adb shell screencap -p /sdcard/filled.png
+          adb pull /sdcard/filled.png ./screenshots/filled.png
+          
+          ls -la screenshots/
+
+      # ──────────────────────────────────────────────
+      # EXTRACT COLOR SCHEME, FONTS, CONSTRAINTS
+      # ──────────────────────────────────────────────
+      - name: Extract detailed Flutter properties
+        run: |
+          cat > /tmp/extract_details.js << 'EOF'
+          const Flutter = require('frida-flutter');
+          
+          Java.perform(async () => {
+            await Flutter.waitForFlutter();
+            
+            const details = {
+              colorScheme: await Flutter.getColorScheme(),
+              textStyles: await Flutter.getTextStyles(),
+              constraints: await Flutter.getConstraints(),
+              animations: await Flutter.getAnimations(),
+              theme: await Flutter.getThemeData(),
+            };
+            
+            const fs = require('fs');
+            fs.writeFileSync('/data/local/tmp/flutter_details.json', JSON.stringify(details, null, 2));
+            console.log("[*] Details extracted");
+          });
+          
+          setTimeout(() => {}, 30000);
+          EOF
+          
+          frida -U -f br.com.nubank -l /tmp/extract_details.js --no-pause -o /tmp/details.log &
+          sleep 20
+          kill %1 2>/dev/null || true
+          
+          adb pull /data/local/tmp/flutter_details.json ./color-scheme.json 2>/dev/null || echo "Details not extracted"
+          
+          # Also dump manifest for font/assets info
+          adb shell "pm dump br.com.nubank" > ./package_dump.txt 2>/dev/null || true
+
+      # ──────────────────────────────────────────────
+      # UPLOAD ARTIFACTS
+      # ──────────────────────────────────────────────
+      - name: Upload widget tree
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: widget-tree-exact
+          path: |
+            widget-tree-exact.json
+            widget-tree-exact.json.*
+          retention-days: 7
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: screenshots/
+          retention-days: 7
+
+      - name: Upload color scheme and details
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: color-scheme
+          path: |
+            color-scheme.json
+            flutter_details.json
+            package_dump.txt
+          retention-days: 7
+
+      - name: Upload Frida logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frida-logs
+          path: |
+            /tmp/frida_output.log
+            /tmp/details.log
+            emulator.log
+          retention-days: 7
