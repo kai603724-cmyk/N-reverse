@@ -20,7 +20,7 @@ jobs:
   reverse:
     name: Reverse Engineering on macOS ARM64
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: read
       actions: write
@@ -40,21 +40,18 @@ jobs:
           python3 --version
 
       # ──────────────────────────────────────────────
-      # ANDROID SDK MANUAL INSTALL (no buggy action)
+      # ANDROID SDK MANUAL INSTALL
       # ──────────────────────────────────────────────
       - name: Install Android SDK manually
         run: |
-          # Download command line tools
           wget -q "https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip" -O cmdline-tools.zip
           mkdir -p $ANDROID_HOME/cmdline-tools
           unzip -q cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools
           mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
           rm cmdline-tools.zip
           
-          # Accept licenses
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
           
-          # Install packages ONE BY ONE (avoid multi-line string bug)
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools"
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-33"
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;33.0.2"
@@ -62,11 +59,10 @@ jobs:
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator"
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125"
           
-          # Verify
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "emulator|system-images|platform-tools|platforms|build-tools|ndk"
 
       # ──────────────────────────────────────────────
-      # CREATE AND BOOT ARM64 AVD
+      # CREATE AVD
       # ──────────────────────────────────────────────
       - name: Create AVD
         run: |
@@ -77,7 +73,10 @@ jobs:
             --force
           echo "AVD created"
 
-      - name: Start emulator with logging
+      # ──────────────────────────────────────────────
+      # START EMULATOR WITH EXTENDED TIMEOUT
+      # ──────────────────────────────────────────────
+      - name: Start emulator
         run: |
           nohup $ANDROID_HOME/emulator/emulator \
             -avd pixel6_arm64 \
@@ -92,14 +91,19 @@ jobs:
           EMULATOR_PID=$!
           echo "Emulator PID: $EMULATOR_PID"
           
-          for i in {1..120}; do
+          # Wait for ADB with extended timeout (30 min)
+          for i in {1..360}; do
             if adb devices | grep -q "emulator"; then
-              echo "ADB connected at attempt $i"
+              echo "ADB connected at attempt $i (${i}x5s = $((i*5))s)"
               break
             fi
             sleep 5
-            if [ $i -eq 120 ]; then
-              echo "TIMEOUT: Emulator didn't start"
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "Still waiting... attempt $i/360 (emulator.log tail):"
+              tail -20 emulator.log
+            fi
+            if [ $i -eq 360 ]; then
+              echo "TIMEOUT: Emulator didn't start after 30 minutes"
               cat emulator.log
               exit 1
             fi
@@ -107,15 +111,20 @@ jobs:
 
       - name: Wait for boot completed
         run: |
-          for i in {1..240}; do
+          echo "Waiting for boot completed..."
+          for i in {1..360}; do
             BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
             if [ "$BOOT" = "1" ]; then
               echo "Boot completed at attempt $i"
               break
             fi
             sleep 5
-            if [ $i -eq 240 ]; then
-              echo "TIMEOUT: Boot not completed"
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "Boot wait... attempt $i/360"
+              adb shell getprop sys.boot_completed 2>/dev/null || echo "ADB not ready"
+            fi
+            if [ $i -eq 360 ]; then
+              echo "TIMEOUT: Boot not completed after 30 minutes"
               adb shell getprop sys.boot_completed
               cat emulator.log
               exit 1
@@ -134,6 +143,8 @@ jobs:
           adb shell settings put global hidden_api_policy 1
           
           echo "Device ready!"
+          adb shell getprop ro.product.model
+          adb shell getprop ro.build.version.release
 
       # ──────────────────────────────────────────────
       # DOWNLOAD NUBANK APK
