@@ -74,17 +74,18 @@ jobs:
           echo "AVD created"
 
       # ──────────────────────────────────────────────
-      # START EMULATOR WITH EXTENDED TIMEOUT
+      # START EMULATOR - MACOS ARM64 OPTIMIZED FLAGS
       # ──────────────────────────────────────────────
       - name: Start emulator
         run: |
+          # Use gpu auto (lets emulator choose best for macOS ARM64 = Metal/host)
+          # Remove -no-window which can cause issues on macOS CI
           nohup $ANDROID_HOME/emulator/emulator \
             -avd pixel6_arm64 \
             -no-snapshot-load \
             -no-boot-anim \
-            -gpu swiftshader_indirect \
+            -gpu auto \
             -no-audio \
-            -no-window \
             -accel on \
             -verbose > emulator.log 2>&1 &
           
@@ -100,7 +101,7 @@ jobs:
             sleep 5
             if [ $((i % 12)) -eq 0 ]; then
               echo "Still waiting... attempt $i/360 (emulator.log tail):"
-              tail -20 emulator.log
+              tail -30 emulator.log
             fi
             if [ $i -eq 360 ]; then
               echo "TIMEOUT: Emulator didn't start after 30 minutes"
